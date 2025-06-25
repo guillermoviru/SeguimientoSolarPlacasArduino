@@ -56,13 +56,15 @@ const char* textoEstadoViento(EstadoViento e);
 bool leerAzimutSEC345(float &azimut);
 void cambiarEstadoAz(EstadoAzimut);
 bool configurarModoPreguntaRespuesta();
+void inicializarBreaker();
+void vigilarBreaker();
 
 /* ---------- CONFIGURACIÓN ---------- */
 #define VERSION_FIRMWARE "2.5.0-ES"
 #define BAUDIOS_SERIAL   115200
 
 /* Macros de log optimizadas */
-#define LOG_INFO(m)    registrarEvento("ℹ️ INFO", m)
+#define LOG_INFO(m) registrarEvento("💡 INFO", m)
 #define LOG_ACCION(m)  registrarEvento("⚙️ ACCIÓN", m)
 #define LOG_ESTADO(m)  registrarEvento("🔄 ESTADO", m)
 #define LOG_MEDIDA(m)  registrarEvento("📊 MEDIDA", m)
@@ -106,6 +108,7 @@ const float     ANG_MAX = 85.0;
 const float     UMBRAL_CAMBIO   = 5.5;
 const uint8_t   MAX_REINTENTOS  = 3;
 const uint32_t  ESPERA_REINT_MS = 10UL * 60 * 1000;
+const uint32_t TIEMPO_MAX_VALVULA = 20UL * 60 * 1000; // 20 minutos
 
 /* ---------- PINES ---------- */
 const int RELAY_SUBIR = D1;
@@ -119,6 +122,9 @@ const int PIN_SETA    = A1;
 const int PIN_ENDSTOP = A0;
 const int LED_IZQ   = D10;
 const int LED_DER   = D11;
+const int LED_ROJO = LEDR;         // LED rojo reset
+const int PIN_BREAKER = A7;          // I8 – detecta si el magneto está bajado
+
 
 /* ---------- VARIABLES GLOBALES ---------- */
 volatile EstadoSistema estado = INICIALIZANDO;
@@ -145,6 +151,12 @@ double azimutObjetivo= 0.0;
 double cenitRealGlobal = 0.0;
 const IPAddress IP_SEC345(192,168,1,150);
 const uint16_t  PUERTO_SEC345 = 502;
+const bool VALVULA_ACTIVA_HIGH = true; // true: la válvula se activa con HIGH
+volatile bool breakerEstadoAnterior = HIGH; // suponemos RED OK al inicio
+bool     valvulaActiva      = false;
+uint32_t tInicioValvulaMs   = 0;          // millis() cuando la encendemos
+bool     breakerFallo     = false;    // true mientras A7 esté LOW
+uint32_t tProxAvisoMs     = 0;        // para avisos cada 30 s
 
 // Buffer para logs
 char logBuffer[256];
@@ -187,6 +199,8 @@ void setup() {
     digitalWrite(LED_DER, LOW);
     digitalWrite(RELAY_SUBIR, LOW);
     digitalWrite(RELAY_BAJAR, LOW);
+
+    inicializarBreaker();
 
     /* Ethernet */
     uint32_t t0 = millis();
@@ -308,6 +322,34 @@ void loop() {
     last_cycle = now;
 
     perro.kick();  // Alimentar watchdog
+    vigilarBreaker();     
+        /* ---------- PAUSA GLOBAL POR FALLO BREAKER ---------- */
+    if (breakerFallo) {
+
+        /* Aviso cada 30 s del tiempo que queda para desconexión */
+        if (millis() >= tProxAvisoMs && valvulaActiva) {
+            uint32_t msRest = TIEMPO_MAX_VALVULA - (millis() - tInicioValvulaMs);
+            uint32_t min    = msRest / 60000;
+            uint32_t seg    = (msRest % 60000) / 1000;
+            char buf[80];
+            snprintf(buf, sizeof(buf),
+                     "Electroválvula ON – quedan %lu min %02lu s",
+                     min, seg);
+            LOG_ADVERT(buf);
+            tProxAvisoMs = millis() + 30000;   // próximo aviso en 30 s
+        }
+
+        /* Cuando pasan los 20 min, valvulaActiva ya se puso false dentro de vigilarBreaker();
+           sólo seguimos avisando de que el fallo persiste cada 30 s */
+        if (!valvulaActiva && millis() >= tProxAvisoMs) {
+            LOG_ADVERT("Fallo persiste – válvula OFF, espera subir magneto");
+            tProxAvisoMs = millis() + 30000;
+        }
+
+        perro.kick();       // alimenta watchdog
+        delay(50);          // pequeño respiro
+        return;             // <<< salta todo el resto del loop
+    }
 
     /* -------- EMERGENCIA (SETA) -------- */
     if (digitalRead(PIN_SETA) == LOW) {
@@ -461,7 +503,7 @@ void loop() {
     if (now - tLog >= 30000) {
         char mensaje[300];
         snprintf(mensaje, sizeof(mensaje),
-            "📊 MEDIDA: 🌡 Cenit=%.1f° | 🎯 ObjC=%.1f° | 📐 CenitReal=%.1f° | 🌞 Elev=%.1f° | "
+            "🌡 Cenit=%.1f° | 🎯 ObjC=%.1f° | 📐 CenitReal=%.1f° | 🌞 Elev=%.1f° | "
             "🧭 AzR=%.1f° | 🎯 ObjA=%.1f° | 💨 Viento=%.1f m/s (%s)",
             anguloActual, 
             anguloObjetivo,
@@ -980,6 +1022,63 @@ void aplicarProteccionViento() {
         if (fabs(nuevo - anguloObjetivo) > 1.0) {
             LOG_ADVERT("Viento 31-45 m/s → objetivo a la mitad");
             anguloObjetivo = nuevo;
+        }
+    }
+    
+}
+/* =========================================================
+   GESTIÓN DEL MAGNETOTÉRMICO
+   ========================================================= */
+void inicializarBreaker() {
+    pinMode(PIN_BREAKER, INPUT_PULLUP);
+    pinMode(LED_BAJAR, OUTPUT);     // tu LED auxiliar libre
+    pinMode(LED_ROJO, OUTPUT);    // LED rojo sobre botón RESET
+
+    // Estado seguro (RED OK)
+    digitalWrite(LED_BAJAR, LOW);
+    digitalWrite(LED_ROJO, LOW);
+    digitalWrite(RELAY_BAJAR, VALVULA_ACTIVA_HIGH ? LOW : HIGH);
+
+    LOG_INFO("Monitor magnetotérmico listo");
+}
+
+/* ======= vigilarBreaker() ======= */
+void vigilarBreaker() {
+    bool estadoActual = digitalRead(PIN_BREAKER);   // HIGH = red OK
+    static bool breakerPrevio = HIGH;               // evita globals extra
+
+    /* --- Flanco de cambio --- */
+    if (estadoActual != breakerPrevio) {
+        breakerPrevio = estadoActual;
+
+        if (estadoActual == LOW) {                  // 🔴 FALLO
+            LOG_ADVERT("⚡ Magnetotérmico bajado – válvula ON (20 min máx)");
+            digitalWrite(LED_BAJAR, HIGH);
+            digitalWrite(LED_ROJO, HIGH);
+            digitalWrite(RELAY_BAJAR, VALVULA_ACTIVA_HIGH ? HIGH : LOW);
+
+            breakerFallo     = true;                // <── PAUSA activa
+            valvulaActiva    = true;
+            tInicioValvulaMs = millis();
+            tProxAvisoMs     = millis();            // primer aviso inmediato
+        } else {                                    // 🟢 Red OK
+            LOG_INFO("⚡ Red restablecida – válvula OFF");
+            digitalWrite(LED_BAJAR, LOW);
+            digitalWrite(LED_ROJO, LOW);
+            digitalWrite(RELAY_BAJAR, VALVULA_ACTIVA_HIGH ? LOW : HIGH);
+
+            breakerFallo  = false;                  // <── PAUSA desactiva
+            valvulaActiva = false;
+        }
+    }
+
+    /* --- Timeout de 20 min mientras sigue el fallo --- */
+    if (estadoActual == LOW && valvulaActiva) {
+        if (millis() - tInicioValvulaMs >= TIEMPO_MAX_VALVULA) {
+            LOG_ADVERT("⏱ 20 min alcanzados – válvula OFF (seguirá el LED en ROJO)");
+            digitalWrite(RELAY_BAJAR, VALVULA_ACTIVA_HIGH ? LOW : HIGH);
+            valvulaActiva = false;
+            /* mantenemos LED_ROJO encendido para indicar que el fallo persiste */
         }
     }
 }
