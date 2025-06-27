@@ -8,8 +8,15 @@
 #include <EthernetUdp.h>
 #include <NTPClient.h>
 #include <ArduinoModbus.h>
-#include <SolarCalculator.h>
+#include <solarfunctions.h>   
+#include <TimeLib.h>      
 #include "mbed.h"
+
+/* ---------- BRÚJULA: auto-calibración ---------- */
+float  azSurRef         = NAN;      // referencia Sur capturada al inicio
+bool   brujulaCalibrada = false;    // pasa a true cuando se promedia
+const  uint16_t MUESTRAS_CALIB = 20;    // lecturas para el promedio
+const  uint32_t TIEMPO_CALIB_MS = 3000; // ventana de 3 s
 
 /* ---------- AJUSTES HMI ---------- */
 const int    CORR_TIEMPO_SEG = +127;   // adelanta 2 min 07 s
@@ -58,6 +65,7 @@ void cambiarEstadoAz(EstadoAzimut);
 bool configurarModoPreguntaRespuesta();
 void inicializarBreaker();
 void vigilarBreaker();
+float decodificarAzimut(uint8_t b0, uint8_t b1, uint8_t b2);
 
 /* ---------- CONFIGURACIÓN ---------- */
 #define VERSION_FIRMWARE "2.5.0-ES"
@@ -110,6 +118,8 @@ const uint8_t   MAX_REINTENTOS  = 3;
 const uint32_t  ESPERA_REINT_MS = 10UL * 60 * 1000;
 const uint32_t TIEMPO_MAX_VALVULA = 20UL * 60 * 1000; // 20 minutos
 
+const unsigned long ZONE_OFFSET = 3600UL;   // 2 h × 3600 s
+
 /* ---------- PINES ---------- */
 const int RELAY_SUBIR = D1;
 const int RELAY_BAJAR = D2;
@@ -157,7 +167,7 @@ bool     valvulaActiva      = false;
 uint32_t tInicioValvulaMs   = 0;          // millis() cuando la encendemos
 bool     breakerFallo     = false;    // true mientras A7 esté LOW
 uint32_t tProxAvisoMs     = 0;        // para avisos cada 30 s
-
+uint32_t tUltimoNtp   = 0;     // ← NUEVO: marca del último intento NTP
 // Buffer para logs
 char logBuffer[256];
 uint32_t tInicioMovimiento = 0;
@@ -214,8 +224,10 @@ void setup() {
 
     /* NTP + primer cálculo solar */
     for (int i = 0; i < 3 && !sincronizarHoraNTP(); i++) delay(1000);
+    tUltimoNtp = millis();            // ← añade esta línea
     actualizarAnguloSolar(millis());
-    tUltimoSolar = millis();
+
+
     
     /* Modbus */
     t0 = millis();
@@ -242,6 +254,31 @@ void setup() {
             {
                 LOG_ADVERT("No pudo activar Q&A en brújula");
             }
+                /* ===== INSERTA DESDE AQUÍ ===== */
+        LOG_INFO("Auto-calibrando Sur… (3 s)");
+        t0 = millis();                    
+        uint16_t ok   = 0;
+        double   suma = 0;
+
+        while (millis() - t0 < TIEMPO_CALIB_MS) {
+            float az;
+            if (leerAzimutSEC345(az)) {   // usa la versión NUEVA de la función
+                suma += az;
+                ok++;
+            }
+            perro.kick();
+            delay(50);
+        }
+
+        if (ok >= 5) {                    // al menos 5 lecturas válidas
+            azSurRef         = suma / ok; // promedio
+            brujulaCalibrada = true;
+            snprintf(logBuffer, sizeof(logBuffer),
+                    "Calibración OK – Sur = %.1f°  (muestras=%u)", azSurRef, ok);
+            LOG_INFO(logBuffer);
+        } else {
+            LOG_ADVERT("Calibración brujula FALLIDA – seguirán grados absolutos");
+        }
     }
 
     /* Primer ángulo del inclinómetro */
@@ -272,38 +309,72 @@ void setup() {
 }
 
 /* =========================================================
-   CÁLCULO SOLAR OPTIMIZADO
+   Cálculo solar → objetivo cenit y objetivo azimut (±180°)
    ========================================================= */
-void actualizarAnguloSolar(uint32_t now) {
+void actualizarAnguloSolar(uint32_t now)
+{
     static double lastCenit = -1000.0;
-    
-    if (fabs(cenitRealGlobal - lastCenit) > 0.1 || now - tUltimoSolar > 300000) {
-        time_t utc = ntp.getEpochTime() + CORR_TIEMPO_SEG;
-        double azN, elev;
-        calcHorizontalCoordinates(utc, LATITUD, LONGITUD, azN, elev);
-        elevacionSolar = elev;
 
-        double azS = azN - 180.0;
-        if (azS <= -180.0) azS += 360.0;
-        if (azS >  180.0)  azS -= 360.0;
-        azimutObjetivo = azS + DESFASE_AZIMUT;
+    /* --- 1. Epoch UTC → hora civil local (UTC+2) ---------------------- */
+    unsigned long utc   = ntp.getEpochTime() + CORR_TIEMPO_SEG;
+    unsigned long civil = utc + ZONE_OFFSET;
 
-        double cenitReal = 90.0 - elev;
-        cenitRealGlobal = cenitReal;
+    /* --- 2. Astronomía básica ---------------------------------------- */
+    double jcn  = calculateJulianCenturyNumber(civil);
+    double eqT  = calculateEquationOfTime(jcn);
+    double dec  = calculateDeclination(jcn);
+    double lst  = calculateLocalSolarTime(civil, eqT, LONGITUD);
+    double ha   = calculateHourAngle(lst);
 
-        double cenitUso = cenitReal > CENIT_MAX ? CENIT_MAX : cenitReal;
-        objetivoCenit = cenitUso + DESFASE_CENIT;
+    double elev = calculateSolarElevation(ha, dec, LATITUD);   // +90° = cenit
+    elevacionSolar = elev;                                     // <── ¡AHORA sí la actualizas!
 
-        if (cenitReal >= -5.0 && cenitReal <= 95.0 &&
-            fabs(anguloObjetivo - cenitUso) > 0.5) {
-            anguloObjetivo = cenitUso;
-        }
+    double azN  = calculateSolarAzimuth(ha, dec, elev, LATITUD);   // 0° = Norte, sentido horario
 
+    /* --- 3. Azimut absoluto normalizado 0-360° ----------------------- */
+    if (azN < 0.0)      azN += 360.0;
+    else if (azN >= 360.0) azN -= 360.0;
+
+    /* --- 4. Pasar a sistema ±180° con 0° = Sur calibrado ------------- */
+    double objRel;
+
+    if (brujulaCalibrada && !isnan(azSurRef)) {
+        /* Sur físico conocido → resta la referencia */
+        objRel = azN - azSurRef;
+    } else {
+        /* Aún sin calibrar: toma Sur geométrico (180°) */
+        objRel = azN - 180.0;
+    }
+
+    /* Normalizar a –180 … +180 */
+    if (objRel >  180.0)  objRel -= 360.0;
+    if (objRel <= -180.0) objRel += 360.0;
+
+    /* Histéresis de 1° para considerar Sur exacto */
+    if (fabs(objRel) < 1.0) objRel = 0.0;
+
+    azimutObjetivo = objRel;          // ← ***valor que tu FSM usa***
+
+    /* --- 5. Cenit objetivo (sin cambios) ----------------------------- */
+    double cenitReal = 90.0 - elev;          // elev → cenit
+    cenitRealGlobal  = cenitReal;
+
+    double cenitUso = (cenitReal > CENIT_MAX) ? CENIT_MAX : cenitReal;
+    objetivoCenit   = cenitUso + DESFASE_CENIT;
+
+    if (cenitReal >= -5.0 && cenitReal <= 95.0 &&
+        fabs(anguloObjetivo - cenitUso) > 0.5)
+    {
+        anguloObjetivo = cenitUso;
+    }
+
+    /* --- 6. Log cada 5 min o si cambia ≥0,1° ------------------------- */
+    if (fabs(cenitRealGlobal - lastCenit) > 0.1 || now - tUltimoSolar > 300000)
+    {
         snprintf(logBuffer, sizeof(logBuffer),
-            "Cenit=%.2f°  Azimut=%.2f° → Obj(C)=%.2f°",
-            cenitReal, azS, anguloObjetivo);
+                 "Cenit=%.2f° → Obj(C)=%.2f°",
+                 cenitReal, anguloObjetivo);
         LOG_MEDIDA(logBuffer);
-
         lastCenit = cenitRealGlobal;
     }
 }
@@ -377,12 +448,16 @@ void loop() {
     actualizarEstadoViento(v);
     aplicarProteccionViento();
 
-    /* -------- NTP cada 5 min -------- */
-    if (now - tUltimoSolar > 300000) {
-        if (sincronizarHoraNTP()) {
-            actualizarAnguloSolar(now);
-            tUltimoSolar = now;
-        }
+    /* 1. actualiza hora NTP cada 5-10 min (si falla, no pasa nada) */
+    if (now - tUltimoNtp > 600000) {          // cada 10 min
+        sincronizarHoraNTP();                 // ignora el retorno
+        tUltimoNtp = now;
+    }
+
+    /* 2. calcula posición solar SIEMPRE cada 30 s (o 1 min) */
+    if (now - tUltimoSolar > 30000) {
+        actualizarAnguloSolar(now);           // usa la hora local ya corregida
+        tUltimoSolar = now;
     }
 
     perro.kick();
@@ -457,8 +532,8 @@ void loop() {
         if (millis() - ultimoLogBrujula > INTERVALO_LOG_BRUJULA && 
             fabs(azimutReal - ultimoAzimut) > 0.5) {
             char tempBuffer[100];
-            snprintf(tempBuffer, sizeof(tempBuffer), "🧭 Azimut: %.1f°", azimutReal);
-            LOG_MEDIDA(tempBuffer);
+           // snprintf(tempBuffer, sizeof(tempBuffer), "🧭 Azimut: %.1f°", azimutReal);
+            //LOG_MEDIDA(tempBuffer);
             ultimoLogBrujula = millis();
             ultimoAzimut = azimutReal;
         }
@@ -491,6 +566,11 @@ void loop() {
             cambiarEstadoAz(AZ_INIT);
         }
     }
+    float d = azimutObjetivo - azimutReal;   // diferencia absoluta
+
+    /* --- NORMALIZAR a rango –180 … +180 --- */
+    if (d >  180.0f)  d -= 360.0f;
+    if (d <= -180.0f) d += 360.0f;
 
     perro.kick();
 
@@ -501,18 +581,28 @@ void loop() {
     /* -------- LOG cada 30 segundos -------- */
     static uint32_t tLog = 0;
     if (now - tLog >= 30000) {
-        char mensaje[300];
-        snprintf(mensaje, sizeof(mensaje),
-            "🌡 Cenit=%.1f° | 🎯 ObjC=%.1f° | 📐 CenitReal=%.1f° | 🌞 Elev=%.1f° | "
-            "🧭 AzR=%.1f° | 🎯 ObjA=%.1f° | 💨 Viento=%.1f m/s (%s)",
-            anguloActual, 
-            anguloObjetivo,
-            cenitRealGlobal,
-            elevacionSolar,
-            azimutReal,
-            azimutObjetivo,
-            v, 
-            textoEstadoViento(estadoViento));
+    char mensaje[300];
+
+    const char* lado =                       // NUEVO
+          (azimutReal == 0.0f) ? "Sur" :
+          (azimutReal  > 0.0f) ? "Oeste" : "Este";
+    const char* ladoObj =
+      (azimutObjetivo == 0.0f) ? "Sur" :
+      (azimutObjetivo  > 0.0f) ? "Oeste" : "Este";
+
+    snprintf(mensaje, sizeof(mensaje),
+        "🌡 Cenit=%.1f° | 🎯 ObjC=%.1f° | 📐 CenitReal=%.1f° | 🌞 Elev=%.1f° | "
+        "🧭 AzR=%+.1f° (%s) | 🎯 ObjA=%.1f° (%s) | 💨 Viento=%.1f m/s (%s)",
+        anguloActual, 
+        anguloObjetivo,
+        cenitRealGlobal,
+        elevacionSolar,
+        azimutReal,          //  <── 1º argumento nuevo
+        lado,                //  <── 2º argumento nuevo
+        azimutObjetivo,
+        ladoObj,
+        v, 
+        textoEstadoViento(estadoViento));
         
         LOG_MEDIDA(mensaje);
         tLog = now;
@@ -520,6 +610,7 @@ void loop() {
 
     perro.kick();
 }
+
 
 /* =========================================================
    FUNCIONES AUXILIARES
@@ -880,75 +971,81 @@ void cambiarEstadoAz(EstadoAzimut nuevo) {
 /* =========================================================
    FUNCIÓN MEJORADA PARA LECTURA DE BRÚJULA (MENOS INTRUSIVA)
    ========================================================= */
-bool leerAzimutSEC345(float &azimut) {
-    const uint16_t REGISTRO_INICIO = 0x03;
-    const uint8_t NUM_REGISTROS = 2;
-    static uint32_t ultimoReintento = 0;
-    const uint32_t INTERVALO_RECONEXION = 30000; // 30 segundos
+/* =========================================================
+   LEE SEC-345  —  normaliza a ±180° y reconecta si falla
+   ========================================================= */
+bool leerAzimutSEC345(float &azOut)
+{
+    const uint16_t REG      = 0x03;   // registro de azimut
+    const uint8_t  NREG     = 2;      // 2 words = 3 bytes útiles
+    const uint32_t T_RETRY  = 30000;  // 30 s entre intentos de socket
+    const uint8_t  MAX_FALL = 5;      // re-abrir socket tras 5 fallos
 
-    // Reconexión silenciosa sin logs
-    if (!modbusBr.connected() && millis() - ultimoReintento > INTERVALO_RECONEXION) {
+    static uint32_t tSock  = 0;       // último intento de begin()
+    static uint8_t  fallos = 0;       // fallos de lectura seguidos
+
+    /* ---------- 1. Revisión del socket ---------- */
+    if (!modbusBr.connected() && millis() - tSock > T_RETRY) {
         modbusBr.stop();
-        delay(100);
+        delay(50);
         modbusBr.begin(IP_SEC345, PUERTO_SEC345);
-        ultimoReintento = millis();
+        tSock = millis();
     }
 
-    // Intentar lectura
-    if (modbusBr.requestFrom(idSEC345, HOLDING_REGISTERS, REGISTRO_INICIO, NUM_REGISTROS)) {
-        uint16_t r1 = modbusBr.read();
-        uint16_t r2 = modbusBr.read();
-
-        // Verificar si los valores son válidos
-        if (r1 == 0xFFFF || r2 == 0xFFFF) {
-            return false;
+    /* ---------- 2. Petición Modbus ---------- */
+    if (!modbusBr.requestFrom(idSEC345, HOLDING_REGISTERS, REG, NREG)) {
+        /* fallo: cuenta y, si excede, reinicia socket ya */
+        if (++fallos >= MAX_FALL) {
+            modbusBr.stop();
+            delay(50);
+            modbusBr.begin(IP_SEC345, PUERTO_SEC345);
+            fallos = 0;
+            tSock  = millis();
         }
-
-        uint8_t b0 = highByte(r1);
-        uint8_t b1 = lowByte(r1);
-        uint8_t b2 = highByte(r2);
-
-        azimut = decodificarAzimut(b0, b1, b2);
-        
-        // Validar rango del azimut
-        if (azimut >= 0 && azimut <= 360) {
-            return true;
-        }
+        return false;
     }
-    return false;
+
+    /* ---------- 3. Decodifica trama ---------- */
+    uint16_t r1 = modbusBr.read();
+    uint16_t r2 = modbusBr.read();
+
+    uint8_t b0 = highByte(r1);
+    uint8_t b1 = lowByte(r1);
+    uint8_t b2 = highByte(r2);
+
+    float azAbs = decodificarAzimut(b0, b1, b2);   // 0-360°
+
+    /* ---------- 4. Conversión a ±180° relativo al Sur ---------- */
+    if (brujulaCalibrada && !isnan(azSurRef)) {
+        float rel = azAbs - azSurRef;              // diferencia bruta
+        if (rel >  180.0f)  rel -= 360.0f;         // normaliza
+        if (rel <= -180.0f) rel += 360.0f;
+        if (fabs(rel) < 1.0f)  rel = 0.0f;         // histéresis ±1°
+        azOut = rel;
+    } else {
+        azOut = azAbs;                             // sin calibrar
+    }
+
+    fallos = 0;                                    // lectura OK
+    return true;
 }
 
 
 /* =========================================================
    FUNCIÓN DE DECODIFICACIÓN MEJORADA
    ========================================================= */
-float decodificarAzimut(uint8_t b0, uint8_t b1, uint8_t b2) {
-    // Verificar byte de signo (bit 7 del primer byte)
-    bool negativo = (b0 & 0x80);
-    
-    // Extraer componentes (3 dígitos enteros + 2 decimales)
-    int grados = ((b0 & 0x7F) >> 4) * 100 +  // Centenas
-                 (b0 & 0x0F) * 10 +          // Decenas
-                 (b1 >> 4);                  // Unidades
-    
-    int decimales = ((b1 & 0x0F) * 10) +      // Décimas
-                    (b2 >> 4);               // Centésimas
-    
-    float azimut = grados + decimales / 100.0;
-    
-    // Aplicar signo si es necesario
-    if (negativo) {
-        azimut = -azimut;
-    }
-    
-    // Normalizar a 0-360°
-    if (azimut < 0) {
-        azimut += 360.0;
-    } else if (azimut >= 360.0) {
-        azimut -= 360.0;
-    }
-    
-    return azimut;
+float decodificarAzimut(uint8_t b0, uint8_t b1, uint8_t b2)
+{
+    bool neg      = b0 & 0x80;                // bit 7 = signo
+    int centenas  = (b0 >> 4) & 0x07;
+    int decenas   =  b0 & 0x0F;
+    int unidades  =  b1 >> 4;
+    int decimales = (b1 & 0x0F) * 10 + (b2 >> 4);
+
+    float ang = (centenas*100 + decenas*10 + unidades) + decimales / 100.0;
+    if (neg) ang = -ang;
+    if (ang < 0) ang += 360.0;
+    return fmod(ang, 360.0f);                 // 0-360 geométrico
 }
 
 
