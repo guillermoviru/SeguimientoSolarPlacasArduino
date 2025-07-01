@@ -19,8 +19,8 @@ const  uint16_t MUESTRAS_CALIB = 20;    // lecturas para el promedio
 const  uint32_t TIEMPO_CALIB_MS = 3000; // ventana de 3 s
 
 /* ---------- AJUSTES HMI ---------- */
-const int    CORR_TIEMPO_SEG = +127;   // adelanta 2 min 07 s
-const double DESFASE_AZIMUT  = 0.00;   // offset opcional
+const int    CORR_TIEMPO_SEG = 0;   // adelanta 2 min 07 s
+const double DESFASE_AZIMUT  = 0;   // offset opcional
 const double DESFASE_CENIT   = 0.00;
 const double CENIT_MAX = 40.0;   // límite superior de apertura
 /* --------------------------------- */
@@ -118,7 +118,7 @@ const uint8_t   MAX_REINTENTOS  = 3;
 const uint32_t  ESPERA_REINT_MS = 10UL * 60 * 1000;
 const uint32_t TIEMPO_MAX_VALVULA = 20UL * 60 * 1000; // 20 minutos
 
-const unsigned long ZONE_OFFSET = 3600UL;   // 2 h × 3600 s
+const unsigned long ZONE_OFFSET = 0UL;   // 2 h × 3600 s
 
 /* ---------- PINES ---------- */
 const int RELAY_SUBIR = D1;
@@ -134,6 +134,7 @@ const int LED_IZQ   = D10;
 const int LED_DER   = D11;
 const int LED_ROJO = LEDR;         // LED rojo reset
 const int PIN_BREAKER = A7;          // I8 – detecta si el magneto está bajado
+const int PIN_ENDSTOP_AZ = A4;  // Asumiendo que usas el pin A4 como I5
 
 
 /* ---------- VARIABLES GLOBALES ---------- */
@@ -172,12 +173,13 @@ uint32_t tUltimoNtp   = 0;     // ← NUEVO: marca del último intento NTP
 char logBuffer[256];
 uint32_t tInicioMovimiento = 0;
 uint32_t tLastAviso = 0;
+double azimutRealAnguloSolar     = 0.0;  // ① tu lectura de la brújula
 
 /* ---------- OBJETOS ---------- */
 EthernetClient        eth;
 ModbusTCPClient       modbus(eth);
 EthernetUDP           ntpUDP;
-NTPClient             ntp(ntpUDP, "216.239.35.0", 0, 60000);
+NTPClient             ntp(ntpUDP, "hora.roa.es", 0, 60000);
 mbed::Watchdog       &perro = mbed::Watchdog::get_instance();
 EthernetClient        ethViento;
 ModbusTCPClient       modbusViento(ethViento);
@@ -202,6 +204,7 @@ void setup() {
     pinMode(RELAY_DER, OUTPUT);
     pinMode(LED_IZQ, OUTPUT);
     pinMode(LED_DER, OUTPUT);
+    pinMode(PIN_ENDSTOP_AZ, INPUT_PULLUP);  
 
     digitalWrite(RELAY_IZQ, LOW);
     digitalWrite(RELAY_DER, LOW);
@@ -314,6 +317,8 @@ void setup() {
 void actualizarAnguloSolar(uint32_t now)
 {
     static double lastCenit = -1000.0;
+    static uint32_t tLastAjuste = 0;
+
 
     /* --- 1. Epoch UTC → hora civil local (UTC+2) ---------------------- */
     unsigned long utc   = ntp.getEpochTime() + CORR_TIEMPO_SEG;
@@ -327,48 +332,70 @@ void actualizarAnguloSolar(uint32_t now)
     double ha   = calculateHourAngle(lst);
 
     double elev = calculateSolarElevation(ha, dec, LATITUD);   // +90° = cenit
-    elevacionSolar = elev;                                     // <── ¡AHORA sí la actualizas!
+    elevacionSolar = elev;
 
     double azN  = calculateSolarAzimuth(ha, dec, elev, LATITUD);   // 0° = Norte, sentido horario
 
     /* --- 3. Azimut absoluto normalizado 0-360° ----------------------- */
-    if (azN < 0.0)      azN += 360.0;
+    if (azN < 0.0)        azN += 360.0;
     else if (azN >= 360.0) azN -= 360.0;
 
-    /* --- 4. Pasar a sistema ±180° con 0° = Sur calibrado ------------- */
-    double objRel;
+    /* --- 4. Siempre usar Sur geométrico → sistema ±180° ------------- */
+    double objRel = azN - 180.0;      // 180° es Sur geométrico
 
-    if (brujulaCalibrada && !isnan(azSurRef)) {
-        /* Sur físico conocido → resta la referencia */
-        objRel = azN - azSurRef;
-    } else {
-        /* Aún sin calibrar: toma Sur geométrico (180°) */
-        objRel = azN - 180.0;
-    }
-
-    /* Normalizar a –180 … +180 */
+    // Normalizar a –180 … +180
     if (objRel >  180.0)  objRel -= 360.0;
     if (objRel <= -180.0) objRel += 360.0;
 
-    /* Histéresis de 1° para considerar Sur exacto */
+    // Histéresis de 1° para considerar Sur exacto
     if (fabs(objRel) < 1.0) objRel = 0.0;
 
-    azimutObjetivo = objRel;          // ← ***valor que tu FSM usa***
+    /* --- 5. Añadir tu desfase de calado definido en config --------- */
+    objRel += DESFASE_AZIMUT;
 
-    /* --- 5. Cenit objetivo (sin cambios) ----------------------------- */
-    double cenitReal = 90.0 - elev;          // elev → cenit
-    cenitRealGlobal  = cenitReal;
+    // Y normalizar de nuevo
+    if (objRel >  180.0)  objRel -= 360.0;
+    if (objRel <= -180.0) objRel += 360.0;
 
-    double cenitUso = (cenitReal > CENIT_MAX) ? CENIT_MAX : cenitReal;
-    objetivoCenit   = cenitUso + DESFASE_CENIT;
+    double ajusteAz = 0.0;
+    if      (objRel >  0.0) ajusteAz =  -8.0;
+    else if (objRel <  0.0) ajusteAz = 8.0;
+    // (si objRel == 0 no ajusta)
 
-    if (cenitReal >= -5.0 && cenitReal <= 95.0 &&
-        fabs(anguloObjetivo - cenitUso) > 0.5)
-    {
-        anguloObjetivo = cenitUso;
+    // Asigna ahora el objetivo con ese desfase adicional
+    azimutObjetivo = objRel + ajusteAz;
+    //zimutObjetivo       = objRel ;
+    azimutRealAnguloSolar= objRel;
+
+    /* --- 6. Cálculo de cenit y objetivo con offset ----------------- */
+    double cenitReal = 90.0 - elev;
+    cenitRealGlobal  = cenitReal;               // sin offset aquí
+
+    double cenitUso  = (cenitReal > CENIT_MAX) ? CENIT_MAX : cenitReal;
+    objetivoCenit    = cenitUso + DESFASE_CENIT;
+
+    if (elevacionSolar > 5.0) {
+        double nuevoObjetivo = cenitUso + DESFASE_CENIT;
+        if (fabs(anguloObjetivo - nuevoObjetivo) > 0.5) {
+            anguloObjetivo = nuevoObjetivo;
+        }
+    } else {
+        anguloObjetivo = 0.0;
     }
 
-    /* --- 6. Log cada 5 min o si cambia ≥0,1° ------------------------- */
+    /* --- 7. Debug completo en cada invocación --------------------- */
+    char debugBuf[256];
+    snprintf(debugBuf, sizeof(debugBuf),
+        "utc=%lu, civil=%lu, jcn=%.6f, eqT=%.6f, dec=%.6f, lst=%.6f, ha=%.6f, "
+        "elev=%.2f, azN=%.2f, objRel=%.2f, cenitReal=%.2f, cenitUso=%.2f, "
+        "objetivoCenit=%.2f, anguloObjetivo=%.2f",
+        utc, civil, jcn, eqT, dec, lst, ha,
+        elev, azN, objRel, cenitReal, cenitUso,
+        objetivoCenit, anguloObjetivo
+    );
+    LOG_MEDIDA(debugBuf);
+
+    /* --- 8. Log cada 5 min o si cambia ≥0,1° ----------------------- */
     if (fabs(cenitRealGlobal - lastCenit) > 0.1 || now - tUltimoSolar > 300000)
     {
         snprintf(logBuffer, sizeof(logBuffer),
@@ -423,21 +450,23 @@ void loop() {
     }
 
     /* -------- EMERGENCIA (SETA) -------- */
-    if (digitalRead(PIN_SETA) == LOW) {
+    if (digitalRead(PIN_SETA) == LOW) {          // ← seta pulsada
         if (!emergenciaActiva) {
             LOG_ERROR_("¡¡EMERGENCIA ACTIVADA!!");
             emergenciaActiva = true;
             cambiarEstado(ERROR_SEGURIDAD);
         }
+        digitalWrite(LED_ROJO, HIGH);            // << NUEVO: enciende LED rojo
         digitalWrite(RELAY_SUBIR, LOW);
         digitalWrite(RELAY_BAJAR, LOW);
         digitalWrite(RELAY_IZQ, LOW);
         digitalWrite(RELAY_DER, LOW);
         return;
-    } else if (emergenciaActiva) {
+    } else if (emergenciaActiva) {               // ← seta liberada
         LOG_ACCION("Emergencia desactivada, recalibrando…");
         emergenciaActiva = false;
         offsetInclinometro = 0.0;
+        digitalWrite(LED_ROJO, LOW);             // << NUEVO: apaga LED rojo
         reiniciarSistema();
     }
 
@@ -466,6 +495,7 @@ void loop() {
     float nuevo = leerAnguloActual();
     anguloActual = 0.7f * anguloActual + 0.3f * nuevo;
     verificarSeguridadMecanica(anguloActual);
+    verificarSeguridadAzimut();
 
     perro.kick();
 
@@ -592,7 +622,7 @@ void loop() {
 
     snprintf(mensaje, sizeof(mensaje),
         "🌡 Cenit=%.1f° | 🎯 ObjC=%.1f° | 📐 CenitReal=%.1f° | 🌞 Elev=%.1f° | "
-        "🧭 AzR=%+.1f° (%s) | 🎯 ObjA=%.1f° (%s) | 💨 Viento=%.1f m/s (%s)",
+        "🧭 AzR=%+.1f° (%s) | 🎯 ObjA=%.1f° (%s) | 🔆 AzSolar=%+.1f°  | 💨 Viento=%.1f m/s (%s)",
         anguloActual, 
         anguloObjetivo,
         cenitRealGlobal,
@@ -601,6 +631,7 @@ void loop() {
         lado,                //  <── 2º argumento nuevo
         azimutObjetivo,
         ladoObj,
+        azimutRealAnguloSolar,
         v, 
         textoEstadoViento(estadoViento));
         
@@ -849,6 +880,18 @@ void verificarSeguridadMecanica(float angulo) {
     }
 }
 
+void verificarSeguridadAzimut() {
+    if (digitalRead(PIN_ENDSTOP_AZ) == LOW) {  // Fin de carrera activado
+        if (estadoAz == MOV_AZ_IZQ || estadoAz == MOV_AZ_DER) {
+            LOG_ADVERT("¡Fin de carrera azimut activado! Deteniendo movimiento");
+            digitalWrite(RELAY_IZQ, LOW);
+            digitalWrite(RELAY_DER, LOW);
+            digitalWrite(LED_IZQ, LOW);
+            digitalWrite(LED_DER, LOW);
+            cambiarEstadoAz(AZ_ERROR_MOV);
+        }
+    }
+}
 /* ---------- Gestión de fallos de movimiento ---------- */
 void manejarErrorMovimiento() {
     numReintentos++;
@@ -928,7 +971,12 @@ void cambiarEstado(EstadoSistema nuevo) {
 /* ---------- FSM Azimut ---------- */
 void cambiarEstadoAz(EstadoAzimut nuevo) {
     if (estadoAz == nuevo) return;
-    
+
+        if ((nuevo == MOV_AZ_IZQ || nuevo == MOV_AZ_DER) && digitalRead(PIN_ENDSTOP_AZ) == LOW) {
+        LOG_ADVERT("Intento de movimiento azimut con fin de carrera activado");
+        return; // Sale sin cambiar el estado actual
+    }
+
     snprintf(logBuffer, sizeof(logBuffer), 
         "Azimut: %d → %d", estadoAz, nuevo);
     LOG_ESTADO(logBuffer);
